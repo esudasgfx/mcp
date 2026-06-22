@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -243,23 +244,7 @@ public sealed class MCPClientService : IMCPClientService, IHostedService, IDispo
             }
 
             _readerCancellation = new CancellationTokenSource();
-            var startInfo = new ProcessStartInfo
-            {
-                FileName = _options.PythonPath,
-                UseShellExecute = false,
-                RedirectStandardInput = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-                WorkingDirectory = Path.GetDirectoryName(scriptPath)!
-            };
-            startInfo.ArgumentList.Add(scriptPath);
-
-            var process = new Process
-            {
-                StartInfo = startInfo,
-                EnableRaisingEvents = true
-            };
+            var process = CreatePythonProcess(_options.PythonPath, scriptPath);
             process.Exited += (_, _) =>
             {
                 _logger.LogCritical(
@@ -269,10 +254,7 @@ public sealed class MCPClientService : IMCPClientService, IHostedService, IDispo
                 FailPendingRequests("Python MCP server exited before responding.");
             };
 
-            if (!process.Start())
-            {
-                throw new InvalidOperationException("Failed to start the Python MCP server process.");
-            }
+            process = StartPythonProcess(process, scriptPath);
 
             _process = process;
             _initialized = false;
@@ -281,12 +263,69 @@ public sealed class MCPClientService : IMCPClientService, IHostedService, IDispo
             _logger.LogInformation(
                 "Started Python MCP server process {ProcessId}: {PythonPath} {ScriptPath}",
                 process.Id,
-                _options.PythonPath,
+                process.StartInfo.FileName,
                 scriptPath);
         }
         finally
         {
             _processLock.Release();
+        }
+    }
+
+    private Process CreatePythonProcess(string pythonPath, string scriptPath)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = pythonPath,
+            UseShellExecute = false,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+            WorkingDirectory = Path.GetDirectoryName(scriptPath)!
+        };
+        startInfo.ArgumentList.Add(scriptPath);
+
+        return new Process
+        {
+            StartInfo = startInfo,
+            EnableRaisingEvents = true
+        };
+    }
+
+    private Process StartPythonProcess(Process process, string scriptPath)
+    {
+        try
+        {
+            if (!process.Start())
+            {
+                throw new InvalidOperationException("Failed to start the Python MCP server process.");
+            }
+
+            return process;
+        }
+        catch (Win32Exception) when (
+            string.Equals(_options.PythonPath, "python", StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogWarning(
+                "Configured Python executable 'python' was not found. Retrying with 'python3'.");
+            process.Dispose();
+            var fallbackProcess = CreatePythonProcess("python3", scriptPath);
+            fallbackProcess.Exited += (_, _) =>
+            {
+                _logger.LogCritical(
+                    "Python MCP server exited unexpectedly with code {ExitCode}.",
+                    SafeExitCode(fallbackProcess));
+                _initialized = false;
+                FailPendingRequests("Python MCP server exited before responding.");
+            };
+
+            if (!fallbackProcess.Start())
+            {
+                throw new InvalidOperationException("Failed to start the Python MCP server process.");
+            }
+
+            return fallbackProcess;
         }
     }
 
