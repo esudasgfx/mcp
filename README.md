@@ -1111,6 +1111,7 @@ Implemented:
 - PostgreSQL config and chat memory.
 - pgvector RAG memory.
 - P6 REST connector aligned to provided Swagger.
+- Docker deployment for web/MCP app plus PostgreSQL/pgvector.
 
 Partially implemented / placeholders:
 
@@ -1119,12 +1120,141 @@ Partially implemented / placeholders:
 - EAM connector is mocked.
 - Unifier connector is mocked.
 
-Recommended next work:
+## Future roadmap
 
-1. Add authentication to the ASP.NET web app.
-2. Convert startup DB creation to EF migrations.
-3. Implement real ACC OAuth + APS APIs.
-4. Implement real Unifier REST calls.
-5. Implement SAP OData/RFC connector.
-6. Add integration tests with sandbox credentials.
-7. Add Docker Compose for PostgreSQL + pgvector + web app.
+The project is designed so future enterprise tools can be added or upgraded in
+the same style as `mcp_gemini_server/tools/p6_tool.py`:
+
+1. Add all non-secret endpoint/auth/config settings to `appsettings.json`.
+2. Seed those settings into the PostgreSQL `ConfigSettings` table from
+   `ConfigStoreService`.
+3. Keep secrets as environment variables or secret-manager references.
+4. Read effective settings in the Python tool from environment variables.
+5. Fetch real enterprise data through a connector class/function.
+6. Normalize the raw response into compact JSON.
+7. Send the relevant JSON plus the user query to Gemini.
+8. Add focused validation against Swagger/OpenAPI documentation or sandbox APIs.
+9. Update this README with endpoint, auth, and troubleshooting notes.
+
+### Tool connector roadmap
+
+Priority real connector work:
+
+1. Autodesk ACC / APS
+   - Implement OAuth 2-legged and/or 3-legged token handling.
+   - Add hub/account/project discovery.
+   - Fetch issues, RFIs, submittals, documents, and model metadata.
+   - Add token caching and refresh handling.
+
+2. Oracle Primavera Unifier
+   - Add REST authentication/session handling.
+   - Fetch shells, business process records, cost sheets, commitments, change
+     orders, risks, and workflow status.
+   - Support configurable BP names and field mappings.
+
+3. SAP
+   - Add OData connector with Basic/OAuth/SAML gateway support.
+   - Support configurable entity sets and `$filter`, `$select`, `$top`.
+   - Add common templates for purchase orders, invoices, vendors, materials, and
+     project systems.
+
+4. EAM
+   - Generalize the connector for IBM Maximo, Hexagon EAM, SAP PM, or other EAM
+     systems.
+   - Fetch assets, work orders, PM schedules, meter readings, and condition
+     history.
+
+5. P6 enhancements
+   - Add optional baseline project fetch.
+   - Add calendar, resource, role, spread, risk, issue, notebook, and project
+     code endpoints.
+   - Add endpoint-specific retry policies.
+   - Add mapping for ObjectId-based project lookup when the user's input is not
+     the P6 `Id`.
+
+6. Excel/PDF enhancements
+   - Add upload support from the web UI.
+   - Store uploaded files in object storage instead of relying on server-local
+     file paths.
+   - Add CSV support.
+   - Add OCR for scanned PDFs.
+
+### Functional roadmap
+
+- Add user authentication and role-based authorization.
+- Add admin-only access around `/api/config`.
+- Add per-user chat sessions and ownership.
+- Add saved prompts and reusable analysis templates.
+- Add "compare projects" and "compare periods" workflows.
+- Add scheduled background sync jobs that pull enterprise data into PostgreSQL.
+- Add a tool execution audit dashboard.
+- Add export to PDF/Excel for chat reports.
+- Add streaming responses in the UI where supported.
+- Add tool result citations showing which retrieved records were used.
+- Add human approval workflow before changing config or calling write APIs.
+
+### RAG and memory improvements
+
+- Add source-specific chunking strategies for long tool responses.
+- Add summary memory per chat session to reduce long-term token usage.
+- Add hybrid search: pgvector semantic search plus PostgreSQL full-text search.
+- Add recency weighting and source weighting.
+- Add per-tool memory scopes.
+- Add memory deletion/retention policies.
+- Add re-index endpoint for rebuilding embeddings after model changes.
+- Add support for alternative embedding providers.
+- Add response citations from retrieved memory records.
+
+### Reliability and operations roadmap
+
+- Replace `EnsureCreated()` with EF Core migrations.
+- Add structured logging with correlation IDs across ASP.NET, MCP request IDs,
+  tool calls, and DB records.
+- Add OpenTelemetry traces and metrics.
+- Add retry/circuit-breaker policies for enterprise REST APIs.
+- Add health endpoints for:
+  - web app,
+  - Python MCP process,
+  - PostgreSQL,
+  - pgvector,
+  - Gemini API,
+  - each enterprise connector.
+- Add Docker image vulnerability scanning.
+- Add Kubernetes manifests or Helm chart.
+- Add backup/restore runbooks for PostgreSQL.
+- Add CI pipeline for build, tests, Docker build, and security scanning.
+
+### Security roadmap
+
+- Move production secrets to Azure Key Vault, AWS Secrets Manager, HashiCorp
+  Vault, or equivalent.
+- Encrypt sensitive DB fields if any secret-like values must be persisted.
+- Add audit logs for config changes and tool calls.
+- Add data loss prevention checks before sending enterprise data to Gemini.
+- Add allowlists for file-system paths used by Excel/PDF tools.
+- Add outbound host allowlists for REST connectors.
+- Add multi-tenant isolation if used by multiple companies or departments.
+
+### Testing roadmap
+
+- Add Python unit tests for every tool.
+- Add mocked REST API tests for P6/ACC/SAP/EAM/Unifier connectors.
+- Add ASP.NET controller/service tests.
+- Add integration tests with Docker Compose and a test PostgreSQL database.
+- Add contract tests generated from Swagger/OpenAPI documents.
+- Add end-to-end UI tests for chat flows.
+- Add load tests for:
+  - concurrent chat requests,
+  - RAG search,
+  - background embedding queue,
+  - MCP stdio request matching.
+
+### Performance roadmap
+
+- Add response streaming where the Gemini/client stack supports it.
+- Add connector-level response caching for repeated project/status lookups.
+- Add background prefetch/indexing for frequently used projects.
+- Add larger-context summarization to reduce token payload size.
+- Add queue metrics for background RAG indexing.
+- Add configurable concurrency limits per enterprise connector.
+- Add pagination handling for large P6/ACC/SAP responses.
