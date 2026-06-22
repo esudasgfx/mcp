@@ -148,8 +148,18 @@ public sealed class ConfigStoreService : IConfigStoreService
         yield return Build("RAG", "EmbeddingFailureCooldownSeconds", _configuration["RAG:EmbeddingFailureCooldownSeconds"] ?? "60", "Cooldown after an embedding API failure before retrying embeddings.");
         yield return Build("RAG", "IndexQueueCapacity", _configuration["RAG:IndexQueueCapacity"] ?? "1000", "Maximum queued background semantic indexing jobs.");
         yield return Build("P6", "BaseUrl", _configuration["P6:BaseUrl"] ?? "https://your-p6-host/p6ws/restapi", "Primavera P6 EPPM REST base URL.");
+        yield return Build("P6", "AuthMode", _configuration["P6:AuthMode"] ?? "basic", "P6 REST auth mode: basic, bearer, or none.");
+        yield return Build("P6", "ProjectEndpoint", _configuration["P6:ProjectEndpoint"] ?? "project", "Relative P6 REST endpoint used to fetch projects.");
+        yield return Build("P6", "ActivityEndpoint", _configuration["P6:ActivityEndpoint"] ?? "activity", "Relative P6 REST endpoint used to fetch activities.");
+        yield return Build("P6", "ProjectCodeParam", _configuration["P6:ProjectCodeParam"] ?? "projectCode", "Query parameter name used for project code on the project endpoint.");
+        yield return Build("P6", "ActivityProjectCodeParam", _configuration["P6:ActivityProjectCodeParam"] ?? "projectCode", "Query parameter name used for project code on the activity endpoint.");
+        yield return Build("P6", "FilterParam", _configuration["P6:FilterParam"] ?? "Filter", "Query parameter name used when P6 filter templates are configured.");
+        yield return Build("P6", "FieldsParam", _configuration["P6:FieldsParam"] ?? "Fields", "Query parameter name used for field selection.");
+        yield return Build("P6", "TimeoutSeconds", _configuration["P6:TimeoutSeconds"] ?? "30", "HTTP timeout for P6 REST requests.");
+        yield return Build("P6", "VerifySsl", _configuration["P6:VerifySsl"] ?? "true", "Whether P6 REST TLS certificates should be verified.");
         yield return Build("P6", "Username", "P6_USERNAME", "Environment variable containing the P6 username.", isSecret: true, secretReference: "P6_USERNAME");
         yield return Build("P6", "Password", "P6_PASSWORD", "Environment variable containing the P6 password.", isSecret: true, secretReference: "P6_PASSWORD");
+        yield return Build("P6", "AccessToken", "P6_ACCESS_TOKEN", "Environment variable containing a P6 bearer access token.", isSecret: true, secretReference: "P6_ACCESS_TOKEN");
         yield return Build("ACC", "BaseUrl", _configuration["ACC:BaseUrl"] ?? "https://developer.api.autodesk.com", "Autodesk Platform Services base URL.");
         yield return Build("ACC", "ClientId", "ACC_CLIENT_ID", "Environment variable containing the APS client id.", isSecret: true, secretReference: "ACC_CLIENT_ID");
         yield return Build("ACC", "ClientSecret", "ACC_CLIENT_SECRET", "Environment variable containing the APS client secret.", isSecret: true, secretReference: "ACC_CLIENT_SECRET");
