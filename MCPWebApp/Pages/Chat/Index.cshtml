@@ -115,6 +115,7 @@
         const chatLog = document.getElementById("chatLog");
 
         let tools = [];
+        let currentSessionId = null;
 
         function appendMessage(kind, title, text) {
             const message = document.createElement("div");
@@ -256,10 +257,13 @@
                 const response = await fetch("/api/chat/send", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ toolName, parameters }),
+                    body: JSON.stringify({ sessionId: currentSessionId, toolName, parameters }),
                     signal: controller.signal
                 });
                 const payload = await response.json();
+                if (payload.sessionId) {
+                    currentSessionId = payload.sessionId;
+                }
 
                 if (!response.ok || !payload.success) {
                     throw new Error(payload.error || "The MCP server returned an error.");
@@ -280,7 +284,10 @@
 
         toolSelect.addEventListener("change", updateParametersForSelectedTool);
         sendButton.addEventListener("click", sendChat);
-        clearButton.addEventListener("click", () => { chatLog.innerHTML = ""; });
+        clearButton.addEventListener("click", () => {
+            chatLog.innerHTML = "";
+            currentSessionId = null;
+        });
 
         loadTools();
     </script>

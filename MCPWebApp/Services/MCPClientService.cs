@@ -12,6 +12,7 @@ public sealed class MCPClientService : IMCPClientService, IHostedService, IDispo
 {
     private readonly ILogger<MCPClientService> _logger;
     private readonly IWebHostEnvironment _environment;
+    private readonly IServiceScopeFactory _scopeFactory;
     private readonly MCPOptions _options;
     private readonly ConcurrentDictionary<string, TaskCompletionSource<string>> _pendingRequests = new();
     private readonly SemaphoreSlim _processLock = new(1, 1);
@@ -21,17 +22,21 @@ public sealed class MCPClientService : IMCPClientService, IHostedService, IDispo
 
     private Process? _process;
     private CancellationTokenSource? _readerCancellation;
+    private int _requestTimeoutSeconds;
     private bool _initialized;
     private bool _disposed;
 
     public MCPClientService(
         ILogger<MCPClientService> logger,
         IWebHostEnvironment environment,
+        IServiceScopeFactory scopeFactory,
         IOptions<MCPOptions> options)
     {
         _logger = logger;
         _environment = environment;
+        _scopeFactory = scopeFactory;
         _options = options.Value;
+        _requestTimeoutSeconds = _options.RequestTimeoutSeconds;
         _jsonOptions = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -80,6 +85,21 @@ public sealed class MCPClientService : IMCPClientService, IHostedService, IDispo
             .EnumerateArray()
             .Select(tool => JsonSerializer.Deserialize<object>(tool.GetRawText(), _jsonOptions)!)
             .ToList();
+    }
+
+    public async Task RestartAsync(CancellationToken cancellationToken = default)
+    {
+        await _processLock.WaitAsync(cancellationToken);
+        try
+        {
+            StopProcess();
+        }
+        finally
+        {
+            _processLock.Release();
+        }
+
+        await EnsureInitializedAsync(cancellationToken);
     }
 
     private async Task EnsureInitializedAsync(CancellationToken cancellationToken)
@@ -158,13 +178,13 @@ public sealed class MCPClientService : IMCPClientService, IHostedService, IDispo
         }
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(_options.RequestTimeoutSeconds));
+        timeout.CancelAfter(TimeSpan.FromSeconds(_requestTimeoutSeconds));
         using var registration = timeout.Token.Register(() =>
         {
             if (_pendingRequests.TryRemove(id, out var pending))
             {
                 pending.TrySetException(new TimeoutException(
-                    $"MCP request '{method}' timed out after {_options.RequestTimeoutSeconds} seconds."));
+                    $"MCP request '{method}' timed out after {_requestTimeoutSeconds} seconds."));
             }
         });
 
@@ -236,7 +256,9 @@ public sealed class MCPClientService : IMCPClientService, IHostedService, IDispo
             }
 
             StopProcess();
-            var scriptPath = ResolveScriptPath();
+            var runtimeSettings = await LoadRuntimeSettingsAsync(cancellationToken);
+            _requestTimeoutSeconds = runtimeSettings.RequestTimeoutSeconds;
+            var scriptPath = ResolveScriptPath(runtimeSettings.ScriptPath);
             if (!File.Exists(scriptPath))
             {
                 _logger.LogError("Python MCP server script does not exist: {ScriptPath}", scriptPath);
@@ -244,7 +266,10 @@ public sealed class MCPClientService : IMCPClientService, IHostedService, IDispo
             }
 
             _readerCancellation = new CancellationTokenSource();
-            var process = CreatePythonProcess(_options.PythonPath, scriptPath);
+            var process = CreatePythonProcess(
+                runtimeSettings.PythonPath,
+                scriptPath,
+                runtimeSettings.EnvironmentVariables);
             process.Exited += (_, _) =>
             {
                 _logger.LogCritical(
@@ -254,7 +279,11 @@ public sealed class MCPClientService : IMCPClientService, IHostedService, IDispo
                 FailPendingRequests("Python MCP server exited before responding.");
             };
 
-            process = StartPythonProcess(process, scriptPath);
+            process = StartPythonProcess(
+                process,
+                scriptPath,
+                runtimeSettings.PythonPath,
+                runtimeSettings.EnvironmentVariables);
 
             _process = process;
             _initialized = false;
@@ -272,7 +301,10 @@ public sealed class MCPClientService : IMCPClientService, IHostedService, IDispo
         }
     }
 
-    private Process CreatePythonProcess(string pythonPath, string scriptPath)
+    private Process CreatePythonProcess(
+        string pythonPath,
+        string scriptPath,
+        IReadOnlyDictionary<string, string> environmentVariables)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -285,6 +317,10 @@ public sealed class MCPClientService : IMCPClientService, IHostedService, IDispo
             WorkingDirectory = Path.GetDirectoryName(scriptPath)!
         };
         startInfo.ArgumentList.Add(scriptPath);
+        foreach (var pair in environmentVariables)
+        {
+            startInfo.Environment[pair.Key] = pair.Value;
+        }
 
         return new Process
         {
@@ -293,7 +329,11 @@ public sealed class MCPClientService : IMCPClientService, IHostedService, IDispo
         };
     }
 
-    private Process StartPythonProcess(Process process, string scriptPath)
+    private Process StartPythonProcess(
+        Process process,
+        string scriptPath,
+        string configuredPythonPath,
+        IReadOnlyDictionary<string, string> environmentVariables)
     {
         try
         {
@@ -305,12 +345,12 @@ public sealed class MCPClientService : IMCPClientService, IHostedService, IDispo
             return process;
         }
         catch (Win32Exception) when (
-            string.Equals(_options.PythonPath, "python", StringComparison.OrdinalIgnoreCase))
+            string.Equals(configuredPythonPath, "python", StringComparison.OrdinalIgnoreCase))
         {
             _logger.LogWarning(
                 "Configured Python executable 'python' was not found. Retrying with 'python3'.");
             process.Dispose();
-            var fallbackProcess = CreatePythonProcess("python3", scriptPath);
+            var fallbackProcess = CreatePythonProcess("python3", scriptPath, environmentVariables);
             fallbackProcess.Exited += (_, _) =>
             {
                 _logger.LogCritical(
@@ -420,14 +460,60 @@ public sealed class MCPClientService : IMCPClientService, IHostedService, IDispo
         }
     }
 
-    private string ResolveScriptPath()
+    private async Task<McpRuntimeSettings> LoadRuntimeSettingsAsync(
+        CancellationToken cancellationToken)
     {
-        if (Path.IsPathRooted(_options.ScriptPath))
+        var runtimeSettings = new McpRuntimeSettings(
+            _options.PythonPath,
+            _options.ScriptPath,
+            _options.RequestTimeoutSeconds,
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase));
+
+        try
         {
-            return Path.GetFullPath(_options.ScriptPath);
+            using var scope = _scopeFactory.CreateScope();
+            var configStore = scope.ServiceProvider.GetRequiredService<IConfigStoreService>();
+            var settings = await configStore.GetSettingsAsync(cancellationToken);
+            var environment = await configStore.GetEffectiveEnvironmentAsync(cancellationToken);
+
+            var pythonPath = FindEffective(settings, "MCP", "PythonPath") ?? runtimeSettings.PythonPath;
+            var scriptPath = FindEffective(settings, "MCP", "ScriptPath") ?? runtimeSettings.ScriptPath;
+            var timeoutValue = FindEffective(settings, "MCP", "RequestTimeoutSeconds");
+            var timeoutSeconds = int.TryParse(timeoutValue, out var parsedTimeout)
+                ? Math.Clamp(parsedTimeout, 1, 600)
+                : runtimeSettings.RequestTimeoutSeconds;
+
+            return new McpRuntimeSettings(pythonPath, scriptPath, timeoutSeconds, environment);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Unable to load MCP runtime settings from the database. Falling back to appsettings.json.");
+            return runtimeSettings;
+        }
+    }
+
+    private string ResolveScriptPath(string scriptPath)
+    {
+        if (Path.IsPathRooted(scriptPath))
+        {
+            return Path.GetFullPath(scriptPath);
         }
 
-        return Path.GetFullPath(Path.Combine(_environment.ContentRootPath, _options.ScriptPath));
+        return Path.GetFullPath(Path.Combine(_environment.ContentRootPath, scriptPath));
+    }
+
+    private static string? FindEffective(
+        IEnumerable<ConfigSettingDto> settings,
+        string category,
+        string key)
+    {
+        return settings
+            .FirstOrDefault(setting =>
+                string.Equals(setting.Category, category, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(setting.Key, key, StringComparison.OrdinalIgnoreCase))
+            ?.EffectiveValue;
     }
 
     private bool IsProcessRunning()
@@ -520,4 +606,10 @@ public sealed class MCPClientService : IMCPClientService, IHostedService, IDispo
         _writeLock.Dispose();
         _disposed = true;
     }
+
+    private sealed record McpRuntimeSettings(
+        string PythonPath,
+        string ScriptPath,
+        int RequestTimeoutSeconds,
+        IReadOnlyDictionary<string, string> EnvironmentVariables);
 }

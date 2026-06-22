@@ -8,4 +8,6 @@ public interface IMCPClientService
         CancellationToken cancellationToken = default);
 
     Task<List<object>> ListToolsAsync(CancellationToken cancellationToken = default);
+
+    Task RestartAsync(CancellationToken cancellationToken = default);
 }

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using MCPWebApp.Models;
 using MCPWebApp.Services;
@@ -10,13 +11,16 @@ namespace MCPWebApp.Controllers.Api;
 public sealed class ChatController : ControllerBase
 {
     private readonly IMCPClientService _mcpClientService;
+    private readonly IChatHistoryService _chatHistoryService;
     private readonly ILogger<ChatController> _logger;
 
     public ChatController(
         IMCPClientService mcpClientService,
+        IChatHistoryService chatHistoryService,
         ILogger<ChatController> logger)
     {
         _mcpClientService = mcpClientService;
+        _chatHistoryService = chatHistoryService;
         _logger = logger;
     }
 
@@ -55,6 +59,25 @@ public sealed class ChatController : ControllerBase
             });
         }
 
+        var stopwatch = Stopwatch.StartNew();
+        var session = await _chatHistoryService.GetOrCreateSessionAsync(
+            request.SessionId,
+            $"Chat - {request.ToolName}",
+            cancellationToken);
+        var parametersJson = request.Parameters.ValueKind == JsonValueKind.Undefined
+            ? "{}"
+            : request.Parameters.GetRawText();
+        var userQuery = ExtractQuery(request.Parameters) ?? parametersJson;
+
+        await _chatHistoryService.AddMessageAsync(
+            session.Id,
+            role: "user",
+            messageText: userQuery,
+            toolName: request.ToolName,
+            parametersJson: parametersJson,
+            eventType: "tool_call_request",
+            cancellationToken: cancellationToken);
+
         try
         {
             var responseJson = await _mcpClientService.SendRequestAsync(
@@ -69,17 +92,47 @@ public sealed class ChatController : ControllerBase
             var content = ExtractToolContent(responseJson, out var error);
             if (error is not null)
             {
+                var errorMessage = await _chatHistoryService.AddMessageAsync(
+                    session.Id,
+                    role: "assistant",
+                    messageText: userQuery,
+                    toolName: request.ToolName,
+                    parametersJson: parametersJson,
+                    rawJsonRpcResponse: responseJson,
+                    eventType: "tool_call_response",
+                    success: false,
+                    errorMessage: error,
+                    durationMs: stopwatch.ElapsedMilliseconds,
+                    cancellationToken: cancellationToken);
+
                 return StatusCode(
                     StatusCodes.Status502BadGateway,
                     new ChatResponse
                     {
+                        SessionId = session.Id,
+                        MessageId = errorMessage.Id,
                         Success = false,
                         Error = error
                     });
             }
 
+            var assistantMessage = await _chatHistoryService.AddMessageAsync(
+                session.Id,
+                role: "assistant",
+                messageText: userQuery,
+                toolName: request.ToolName,
+                parametersJson: parametersJson,
+                responseText: content,
+                rawJsonRpcResponse: responseJson,
+                eventType: "tool_call_response",
+                success: true,
+                durationMs: stopwatch.ElapsedMilliseconds,
+                cancellationToken: cancellationToken);
+
             return Ok(new ChatResponse
             {
+                SessionId = session.Id,
+                MessageId = assistantMessage.Id,
                 Success = true,
                 Content = content
             });
@@ -87,10 +140,24 @@ public sealed class ChatController : ControllerBase
         catch (TimeoutException ex)
         {
             _logger.LogWarning(ex, "MCP tool call timed out.");
+            var errorMessage = await _chatHistoryService.AddMessageAsync(
+                session.Id,
+                role: "assistant",
+                messageText: userQuery,
+                toolName: request.ToolName,
+                parametersJson: parametersJson,
+                eventType: "tool_call_response",
+                success: false,
+                errorMessage: "The Python MCP server took too long to respond.",
+                durationMs: stopwatch.ElapsedMilliseconds,
+                cancellationToken: cancellationToken);
+
             return StatusCode(
                 StatusCodes.Status504GatewayTimeout,
                 new ChatResponse
                 {
+                    SessionId = session.Id,
+                    MessageId = errorMessage.Id,
                     Success = false,
                     Error = "The Python MCP server took too long to respond."
                 });
@@ -98,14 +165,45 @@ public sealed class ChatController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to call MCP tool {ToolName}.", request.ToolName);
+            var errorMessage = await _chatHistoryService.AddMessageAsync(
+                session.Id,
+                role: "assistant",
+                messageText: userQuery,
+                toolName: request.ToolName,
+                parametersJson: parametersJson,
+                eventType: "tool_call_response",
+                success: false,
+                errorMessage: "Unable to get a response from the Python MCP server.",
+                durationMs: stopwatch.ElapsedMilliseconds,
+                cancellationToken: cancellationToken);
+
             return StatusCode(
                 StatusCodes.Status502BadGateway,
                 new ChatResponse
                 {
+                    SessionId = session.Id,
+                    MessageId = errorMessage.Id,
                     Success = false,
                     Error = "Unable to get a response from the Python MCP server."
                 });
         }
+    }
+
+    [HttpGet("history")]
+    public async Task<ActionResult<List<ChatHistoryDto>>> GetHistory(
+        [FromQuery] int take = 20,
+        CancellationToken cancellationToken = default)
+    {
+        return await _chatHistoryService.GetRecentSessionsAsync(take, cancellationToken);
+    }
+
+    [HttpGet("history/{sessionId:guid}")]
+    public async Task<ActionResult<ChatHistoryDto>> GetSession(
+        Guid sessionId,
+        CancellationToken cancellationToken)
+    {
+        var session = await _chatHistoryService.GetSessionAsync(sessionId, cancellationToken);
+        return session is null ? NotFound() : Ok(session);
     }
 
     private static string ExtractToolContent(string responseJson, out string? error)
@@ -143,5 +241,17 @@ public sealed class ChatController : ControllerBase
         }
 
         return result.ToString();
+    }
+
+    private static string? ExtractQuery(JsonElement parameters)
+    {
+        if (parameters.ValueKind == JsonValueKind.Object &&
+            parameters.TryGetProperty("query", out var query) &&
+            query.ValueKind == JsonValueKind.String)
+        {
+            return query.GetString();
+        }
+
+        return null;
     }
 }
