@@ -6,13 +6,16 @@ using Microsoft.EntityFrameworkCore;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.Configure<MCPOptions>(builder.Configuration.GetSection("MCP"));
+builder.Services.Configure<RagOptions>(builder.Configuration.GetSection("RAG"));
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));
 builder.Services.AddHttpClient();
+builder.Services.AddHttpClient<IEmbeddingService, GeminiEmbeddingService>();
 builder.Services.AddControllers();
 builder.Services.AddRazorPages();
 builder.Services.AddScoped<IConfigStoreService, ConfigStoreService>();
 builder.Services.AddScoped<IChatHistoryService, ChatHistoryService>();
+builder.Services.AddScoped<IRagMemoryService, RagMemoryService>();
 builder.Services.AddHostedService<DatabaseInitializerHostedService>();
 
 builder.Services.AddSingleton<MCPClientService>();

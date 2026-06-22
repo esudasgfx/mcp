@@ -11,4 +11,6 @@ public sealed class ChatResponse
     public string? Content { get; set; }
 
     public string? Error { get; set; }
+
+    public int RetrievedMemoryCount { get; set; }
 }

@@ -138,6 +138,11 @@ public sealed class ConfigStoreService : IConfigStoreService
         yield return Build("MCP", "RequestTimeoutSeconds", _mcpOptions.RequestTimeoutSeconds.ToString(), "Timeout for each JSON-RPC MCP request.");
         yield return Build("Gemini", "Model", Environment.GetEnvironmentVariable("GEMINI_MODEL") ?? "gemini-2.5-flash", "Gemini model used by the Python MCP server.");
         yield return Build("Gemini", "ApiKey", "GEMINI_API_KEY", "Environment variable containing the Gemini API key.", isSecret: true, secretReference: "GEMINI_API_KEY");
+        yield return Build("RAG", "Enabled", _configuration["RAG:Enabled"] ?? "true", "Enables Gemini embeddings and pgvector semantic memory.");
+        yield return Build("RAG", "EmbeddingModel", _configuration["RAG:EmbeddingModel"] ?? "text-embedding-004", "Gemini embedding model used for semantic memory.");
+        yield return Build("RAG", "TopK", _configuration["RAG:TopK"] ?? "5", "Number of semantic memories retrieved per user query.");
+        yield return Build("RAG", "MinSimilarity", _configuration["RAG:MinSimilarity"] ?? "0.72", "Minimum cosine similarity required for retrieved memories.");
+        yield return Build("RAG", "MaxContextChars", _configuration["RAG:MaxContextChars"] ?? "6000", "Maximum retrieved memory characters injected into the active query.");
         yield return Build("P6", "BaseUrl", _configuration["P6:BaseUrl"] ?? "https://your-p6-host/p6ws/restapi", "Primavera P6 EPPM REST base URL.");
         yield return Build("P6", "Username", "P6_USERNAME", "Environment variable containing the P6 username.", isSecret: true, secretReference: "P6_USERNAME");
         yield return Build("P6", "Password", "P6_PASSWORD", "Environment variable containing the P6 password.", isSecret: true, secretReference: "P6_PASSWORD");

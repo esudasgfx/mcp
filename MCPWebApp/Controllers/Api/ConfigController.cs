@@ -12,17 +12,20 @@ public sealed class ConfigController : ControllerBase
     private readonly IConfigStoreService _configStoreService;
     private readonly IChatHistoryService _chatHistoryService;
     private readonly IMCPClientService _mcpClientService;
+    private readonly IRagMemoryService _ragMemoryService;
     private readonly ILogger<ConfigController> _logger;
 
     public ConfigController(
         IConfigStoreService configStoreService,
         IChatHistoryService chatHistoryService,
         IMCPClientService mcpClientService,
+        IRagMemoryService ragMemoryService,
         ILogger<ConfigController> logger)
     {
         _configStoreService = configStoreService;
         _chatHistoryService = chatHistoryService;
         _mcpClientService = mcpClientService;
+        _ragMemoryService = ragMemoryService;
         _logger = logger;
     }
 
@@ -50,7 +53,7 @@ public sealed class ConfigController : ControllerBase
                 "Configuration changes",
                 cancellationToken);
 
-            await _chatHistoryService.AddMessageAsync(
+            var configMessage = await _chatHistoryService.AddMessageAsync(
                 session.Id,
                 role: "system",
                 messageText: request.Reason,
@@ -58,6 +61,14 @@ public sealed class ConfigController : ControllerBase
                 responseText: $"Updated config override {updated.Category}:{updated.Key}.",
                 eventType: "config_change",
                 success: true,
+                cancellationToken: cancellationToken);
+            await _ragMemoryService.IndexConfigSettingAsync(updated, cancellationToken);
+            await _ragMemoryService.UpsertMemoryAsync(
+                "chat_message",
+                configMessage.Id,
+                $"Configuration change: {request.Reason}\n{updated.Category}:{updated.Key} -> {updated.EffectiveValue}",
+                chatSessionId: session.Id,
+                metadataJson: JsonSerializer.Serialize(request),
                 cancellationToken: cancellationToken);
 
             // Settings such as Gemini model, tool endpoints, and Python process

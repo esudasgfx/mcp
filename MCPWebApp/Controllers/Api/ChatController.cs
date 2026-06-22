@@ -1,8 +1,10 @@
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
 using MCPWebApp.Models;
 using MCPWebApp.Services;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
 
 namespace MCPWebApp.Controllers.Api;
 
@@ -12,15 +14,21 @@ public sealed class ChatController : ControllerBase
 {
     private readonly IMCPClientService _mcpClientService;
     private readonly IChatHistoryService _chatHistoryService;
+    private readonly IRagMemoryService _ragMemoryService;
+    private readonly RagOptions _ragOptions;
     private readonly ILogger<ChatController> _logger;
 
     public ChatController(
         IMCPClientService mcpClientService,
         IChatHistoryService chatHistoryService,
+        IRagMemoryService ragMemoryService,
+        IOptions<RagOptions> ragOptions,
         ILogger<ChatController> logger)
     {
         _mcpClientService = mcpClientService;
         _chatHistoryService = chatHistoryService;
+        _ragMemoryService = ragMemoryService;
+        _ragOptions = ragOptions.Value;
         _logger = logger;
     }
 
@@ -68,14 +76,29 @@ public sealed class ChatController : ControllerBase
             ? "{}"
             : request.Parameters.GetRawText();
         var userQuery = ExtractQuery(request.Parameters) ?? parametersJson;
+        var retrievedMemories = await _ragMemoryService.SearchAsync(
+            userQuery,
+            cancellationToken: cancellationToken);
+        var augmentedArguments = AugmentParametersWithMemory(
+            request.Parameters,
+            userQuery,
+            retrievedMemories,
+            _ragOptions.MaxContextChars);
 
-        await _chatHistoryService.AddMessageAsync(
+        var userMessage = await _chatHistoryService.AddMessageAsync(
             session.Id,
             role: "user",
             messageText: userQuery,
             toolName: request.ToolName,
             parametersJson: parametersJson,
             eventType: "tool_call_request",
+            cancellationToken: cancellationToken);
+        await _ragMemoryService.UpsertMemoryAsync(
+            "chat_message",
+            userMessage.Id,
+            BuildMemoryContent(userMessage.Role, userMessage.ToolName, userMessage.MessageText, userMessage.ParametersJson),
+            chatSessionId: session.Id,
+            toolName: request.ToolName,
             cancellationToken: cancellationToken);
 
         try
@@ -85,7 +108,7 @@ public sealed class ChatController : ControllerBase
                 new
                 {
                     name = request.ToolName,
-                    arguments = request.Parameters
+                    arguments = augmentedArguments
                 },
                 cancellationToken);
 
@@ -112,7 +135,8 @@ public sealed class ChatController : ControllerBase
                         SessionId = session.Id,
                         MessageId = errorMessage.Id,
                         Success = false,
-                        Error = error
+                        Error = error,
+                        RetrievedMemoryCount = retrievedMemories.Count
                     });
             }
 
@@ -128,13 +152,25 @@ public sealed class ChatController : ControllerBase
                 success: true,
                 durationMs: stopwatch.ElapsedMilliseconds,
                 cancellationToken: cancellationToken);
+            await _ragMemoryService.UpsertMemoryAsync(
+                "chat_message",
+                assistantMessage.Id,
+                BuildMemoryContent(
+                    assistantMessage.Role,
+                    assistantMessage.ToolName,
+                    assistantMessage.ResponseText,
+                    assistantMessage.ParametersJson),
+                chatSessionId: session.Id,
+                toolName: request.ToolName,
+                cancellationToken: cancellationToken);
 
             return Ok(new ChatResponse
             {
                 SessionId = session.Id,
                 MessageId = assistantMessage.Id,
                 Success = true,
-                Content = content
+                Content = content,
+                RetrievedMemoryCount = retrievedMemories.Count
             });
         }
         catch (TimeoutException ex)
@@ -159,7 +195,8 @@ public sealed class ChatController : ControllerBase
                     SessionId = session.Id,
                     MessageId = errorMessage.Id,
                     Success = false,
-                    Error = "The Python MCP server took too long to respond."
+                    Error = "The Python MCP server took too long to respond.",
+                    RetrievedMemoryCount = retrievedMemories.Count
                 });
         }
         catch (Exception ex)
@@ -184,9 +221,27 @@ public sealed class ChatController : ControllerBase
                     SessionId = session.Id,
                     MessageId = errorMessage.Id,
                     Success = false,
-                    Error = "Unable to get a response from the Python MCP server."
+                    Error = "Unable to get a response from the Python MCP server.",
+                    RetrievedMemoryCount = retrievedMemories.Count
                 });
         }
+    }
+
+    [HttpPost("memory/search")]
+    public async Task<ActionResult<List<MemorySearchResultDto>>> SearchMemory(
+        [FromBody] MemorySearchRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(request.Query))
+        {
+            return BadRequest("Query is required.");
+        }
+
+        return await _ragMemoryService.SearchAsync(
+            request.Query,
+            request.TopK,
+            request.MinSimilarity,
+            cancellationToken);
     }
 
     [HttpGet("history")]
@@ -253,5 +308,84 @@ public sealed class ChatController : ControllerBase
         }
 
         return null;
+    }
+
+    private static Dictionary<string, object?> AugmentParametersWithMemory(
+        JsonElement parameters,
+        string userQuery,
+        IReadOnlyList<MemorySearchResultDto> retrievedMemories,
+        int maxContextChars)
+    {
+        var arguments = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        if (parameters.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in parameters.EnumerateObject())
+            {
+                arguments[property.Name] = property.Value.Clone();
+            }
+        }
+
+        if (retrievedMemories.Count == 0)
+        {
+            return arguments;
+        }
+
+        var existingQuery = arguments.TryGetValue("query", out var queryValue)
+            ? JsonSerializer.Serialize(queryValue).Trim('"')
+            : userQuery;
+        var memoryContext = BuildMemoryContext(retrievedMemories, maxContextChars);
+        arguments["query"] =
+            $"{existingQuery}\n\nRelevant prior memory retrieved from PostgreSQL/pgvector:\n{memoryContext}\n\nUse this memory only when it is relevant to the current request.";
+
+        return arguments;
+    }
+
+    private static string BuildMemoryContext(
+        IReadOnlyList<MemorySearchResultDto> retrievedMemories,
+        int maxContextChars)
+    {
+        var builder = new StringBuilder();
+        foreach (var memory in retrievedMemories)
+        {
+            builder
+                .Append("- [")
+                .Append(memory.SourceType)
+                .Append(" similarity=")
+                .Append(memory.Similarity.ToString("0.000"))
+                .Append("] ")
+                .Append(memory.Content.ReplaceLineEndings(" "))
+                .AppendLine();
+
+            if (builder.Length >= maxContextChars)
+            {
+                break;
+            }
+        }
+
+        var context = builder.ToString();
+        return context.Length <= maxContextChars
+            ? context
+            : context[..maxContextChars];
+    }
+
+    private static string BuildMemoryContent(
+        string role,
+        string? toolName,
+        string? text,
+        string? parametersJson)
+    {
+        return new StringBuilder()
+            .Append("Role: ")
+            .Append(role)
+            .AppendLine()
+            .Append("Tool: ")
+            .Append(toolName)
+            .AppendLine()
+            .Append("Text: ")
+            .Append(text)
+            .AppendLine()
+            .Append("Parameters: ")
+            .Append(parametersJson)
+            .ToString();
     }
 }

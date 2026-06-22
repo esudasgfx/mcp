@@ -31,13 +31,22 @@ public sealed class DatabaseInitializerHostedService : IHostedService
         using var scope = _serviceProvider.CreateScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var configStore = scope.ServiceProvider.GetRequiredService<IConfigStoreService>();
+        var ragMemory = scope.ServiceProvider.GetRequiredService<IRagMemoryService>();
 
         // For this starter app we create the schema if it does not exist, then
         // seed defaults into ConfigSettings. Enterprise deployments can replace
         // this with EF migrations in their release pipeline.
         await dbContext.Database.EnsureCreatedAsync(cancellationToken);
         await configStore.SeedDefaultsAsync(cancellationToken);
-        _logger.LogInformation("Database schema checked and default config settings seeded.");
+        await ragMemory.InitializeAsync(cancellationToken);
+
+        var settings = await configStore.GetSettingsAsync(cancellationToken);
+        foreach (var setting in settings)
+        {
+            await ragMemory.IndexConfigSettingAsync(setting, cancellationToken);
+        }
+
+        _logger.LogInformation("Database schema checked, default config settings seeded, and semantic memory initialized.");
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
