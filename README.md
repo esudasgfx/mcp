@@ -37,6 +37,11 @@ Gemini embeddings plus PostgreSQL `pgvector` for context-based RAG memory.
 
 ```text
 .
+|-- Dockerfile
+|-- docker-compose.yml
+|-- .env.example
+|-- docker/
+|   `-- postgres/init/001-enable-pgvector.sql
 |-- mcp_gemini_server/
 |   |-- main.py
 |   |-- config.py
@@ -168,6 +173,212 @@ sudo -u postgres psql -d mcp_gemini -c "CREATE EXTENSION IF NOT EXISTS vector;"
 
 Creating the extension usually requires a PostgreSQL superuser. The app user can
 use the vector table after the extension is installed.
+
+## Docker deployment
+
+Docker is the easiest way to run the full stack locally or on a server. The
+deployment uses:
+
+- one application container containing:
+  - ASP.NET Core web app,
+  - Python runtime,
+  - Python MCP server,
+  - Python MCP dependencies installed in `/opt/mcp-python`;
+- one PostgreSQL container using `pgvector/pgvector:pg16`;
+- a persistent PostgreSQL volume;
+- an initialization SQL script that enables `CREATE EXTENSION vector`.
+
+The Python MCP server is packaged into the same container as the ASP.NET app
+because the MCP transport is stdio. The web app must spawn the Python process
+locally; it cannot talk to a remote MCP stdio process over HTTP.
+
+### Docker files
+
+```text
+Dockerfile
+docker-compose.yml
+.env.example
+docker/postgres/init/001-enable-pgvector.sql
+```
+
+### Quick start
+
+1. Copy the environment template:
+
+```bash
+cp .env.example .env
+```
+
+2. Edit `.env` and set at minimum:
+
+```bash
+GEMINI_API_KEY=your-real-gemini-key
+POSTGRES_PASSWORD=change-this-password
+```
+
+3. Start the stack:
+
+```bash
+docker compose up --build
+```
+
+4. Open the web UI:
+
+```text
+http://localhost:5080/Chat
+```
+
+5. Verify tools:
+
+```bash
+curl -sS http://localhost:5080/api/chat/tools
+```
+
+### Docker Compose services
+
+`postgres`
+
+- Image: `pgvector/pgvector:pg16`
+- Exposes `${POSTGRES_PORT:-5432}`
+- Stores data in the `postgres-data` named volume
+- Runs `docker/postgres/init/001-enable-pgvector.sql` on first database creation
+- Health check uses `pg_isready`
+
+`web`
+
+- Builds from the root `Dockerfile`
+- Exposes `${WEB_PORT:-5080}` to container port `8080`
+- Runs `dotnet MCPWebApp.dll`
+- Starts the Python MCP server as a child process through `MCPClientService`
+- Uses `/opt/mcp-python/bin/python` as the Python executable
+
+### Useful Docker commands
+
+Build only:
+
+```bash
+docker compose build
+```
+
+Start in background:
+
+```bash
+docker compose up -d
+```
+
+View logs:
+
+```bash
+docker compose logs -f web
+docker compose logs -f postgres
+```
+
+Stop containers:
+
+```bash
+docker compose down
+```
+
+Stop and delete PostgreSQL data:
+
+```bash
+docker compose down -v
+```
+
+Rebuild after code changes:
+
+```bash
+docker compose up --build
+```
+
+### Docker environment variables
+
+`.env.example` documents the main variables. The most important ones are:
+
+```bash
+WEB_PORT=5080
+POSTGRES_DB=mcp_gemini
+POSTGRES_USER=mcp_user
+POSTGRES_PASSWORD=change-me
+GEMINI_API_KEY=replace-with-your-gemini-api-key
+GEMINI_MODEL=gemini-2.5-flash
+```
+
+P6 settings:
+
+```bash
+P6_BASE_URL=https://primavera.iges.in:18206/p6ws/restapi
+P6_AUTH_MODE=basic
+P6_USERNAME=
+P6_PASSWORD=
+P6_AUTH_TOKEN=
+P6_ACCESS_TOKEN=
+```
+
+RAG settings:
+
+```bash
+RAG_ENABLED=true
+RAG_EMBEDDING_MODEL=text-embedding-004
+RAG_SEARCH_TIMEOUT_MS=1500
+RAG_INDEX_QUEUE_CAPACITY=1000
+```
+
+### Docker image internals
+
+The image uses a multi-stage build:
+
+1. `mcr.microsoft.com/dotnet/sdk:8.0`
+   - restores and publishes `MCPWebApp`.
+2. `mcr.microsoft.com/dotnet/aspnet:8.0-bookworm-slim`
+   - installs Python 3 and `python3-venv`,
+   - creates `/opt/mcp-python`,
+   - installs `mcp_gemini_server/requirements.txt`,
+   - copies the published ASP.NET app,
+   - copies `mcp_gemini_server`.
+
+Runtime paths:
+
+```text
+/app/MCPWebApp
+/app/mcp_gemini_server
+/opt/mcp-python/bin/python
+```
+
+The container sets:
+
+```bash
+MCP__PythonPath=/opt/mcp-python/bin/python
+MCP__ScriptPath=../mcp_gemini_server/main.py
+ASPNETCORE_URLS=http://+:8080
+```
+
+### Docker health check
+
+The application image health check calls:
+
+```text
+http://127.0.0.1:8080/api/chat/tools
+```
+
+This verifies that:
+
+- ASP.NET is responding,
+- the Python MCP server can start,
+- MCP `tools/list` works.
+
+### Docker production notes
+
+- Replace `.env` secrets with your orchestrator's secret manager in production.
+- Do not publish the PostgreSQL port publicly unless required.
+- Use a reverse proxy or ingress controller with TLS in front of the web app.
+- Add ASP.NET authentication before exposing config APIs.
+- Keep `postgres-data` backed up.
+- For Kubernetes, split this into:
+  - Deployment for the web/MCP image,
+  - StatefulSet or managed PostgreSQL with pgvector,
+  - Secret objects for Gemini/P6 credentials,
+  - ConfigMap for non-secret config defaults.
 
 ## Python server setup
 

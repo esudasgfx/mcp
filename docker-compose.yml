@@ -1,0 +1,82 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: mcp-gemini-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mcp_gemini}
+      POSTGRES_USER: ${POSTGRES_USER:-mcp_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mcp-gemini-webapp:local
+    container_name: mcp-gemini-webapp
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Production}
+      ASPNETCORE_URLS: http://+:8080
+      ConnectionStrings__DefaultConnection: Host=postgres;Port=5432;Database=${POSTGRES_DB:-mcp_gemini};Username=${POSTGRES_USER:-mcp_user};Password=${POSTGRES_PASSWORD:-change-me}
+      Database__InitializeOnStartup: ${DATABASE_INITIALIZE_ON_STARTUP:-true}
+
+      # Python MCP server process settings inside the container.
+      MCP__PythonPath: /opt/mcp-python/bin/python
+      MCP__ScriptPath: ../mcp_gemini_server/main.py
+      MCP__RequestTimeoutSeconds: ${MCP_REQUEST_TIMEOUT_SECONDS:-60}
+
+      # Gemini.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY in .env or the shell}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      GEMINI_TEMPERATURE: ${GEMINI_TEMPERATURE:-0.2}
+
+      # RAG tuning.
+      RAG__Enabled: ${RAG_ENABLED:-true}
+      RAG__EmbeddingModel: ${RAG_EMBEDDING_MODEL:-text-embedding-004}
+      RAG__EmbeddingDimensions: ${RAG_EMBEDDING_DIMENSIONS:-768}
+      RAG__TopK: ${RAG_TOP_K:-5}
+      RAG__MinSimilarity: ${RAG_MIN_SIMILARITY:-0.72}
+      RAG__MaxContextChars: ${RAG_MAX_CONTEXT_CHARS:-6000}
+      RAG__SearchTimeoutMs: ${RAG_SEARCH_TIMEOUT_MS:-1500}
+      RAG__EmbeddingCacheMinutes: ${RAG_EMBEDDING_CACHE_MINUTES:-30}
+      RAG__EmbeddingFailureCooldownSeconds: ${RAG_EMBEDDING_FAILURE_COOLDOWN_SECONDS:-60}
+      RAG__IndexQueueCapacity: ${RAG_INDEX_QUEUE_CAPACITY:-1000}
+
+      # P6 non-secret settings. Secrets should stay in .env or a secret manager.
+      P6__BaseUrl: ${P6_BASE_URL:-https://primavera.iges.in:18206/p6ws/restapi}
+      P6__AuthMode: ${P6_AUTH_MODE:-basic}
+      P6__ProjectEndpoint: ${P6_PROJECT_ENDPOINT:-project}
+      P6__ActivityEndpoint: ${P6_ACTIVITY_ENDPOINT:-activity}
+      P6__WbsEndpoint: ${P6_WBS_ENDPOINT:-wbs}
+      P6__RelationshipEndpoint: ${P6_RELATIONSHIP_ENDPOINT:-relationship}
+      P6__ResourceAssignmentEndpoint: ${P6_RESOURCE_ASSIGNMENT_ENDPOINT:-resourceAssignment}
+      P6__FilterParam: ${P6_FILTER_PARAM:-Filter}
+      P6__FieldsParam: ${P6_FIELDS_PARAM:-Fields}
+      P6__TimeoutSeconds: ${P6_TIMEOUT_SECONDS:-30}
+      P6__VerifySsl: ${P6_VERIFY_SSL:-true}
+
+      # P6 secrets are inherited by the Python MCP process.
+      P6_USERNAME: ${P6_USERNAME:-}
+      P6_PASSWORD: ${P6_PASSWORD:-}
+      P6_AUTH_TOKEN: ${P6_AUTH_TOKEN:-}
+      P6_ACCESS_TOKEN: ${P6_ACCESS_TOKEN:-}
+      P6_TOKEN_HEADER: ${P6_TOKEN_HEADER:-AuthToken}
+    ports:
+      - "${WEB_PORT:-5080}:8080"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
