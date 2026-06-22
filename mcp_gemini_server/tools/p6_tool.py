@@ -1,0 +1,469 @@
+"""Primavera P6 EPPM REST connector tool."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import urljoin
+
+import requests
+from requests.auth import HTTPBasicAuth
+
+from core.base_tool import BaseTool
+from core.gemini_client import GeminiClient
+
+
+@dataclass(frozen=True)
+class P6ConnectionSettings:
+    """Environment-driven P6 REST connection settings."""
+
+    base_url: str | None
+    auth_mode: str
+    username: str | None
+    password: str | None
+    token: str | None
+    token_header: str
+    project_endpoint: str
+    activity_endpoint: str
+    wbs_endpoint: str
+    relationship_endpoint: str
+    resource_assignment_endpoint: str
+    filter_param: str
+    project_filter_template: str | None
+    activity_filter_template: str | None
+    wbs_filter_template: str | None
+    relationship_filter_template: str | None
+    resource_assignment_filter_template: str | None
+    fields_param: str
+    project_fields: str | None
+    activity_fields: str | None
+    wbs_fields: str | None
+    relationship_fields: str | None
+    resource_assignment_fields: str | None
+    timeout_seconds: float
+    verify_ssl: bool
+
+
+class P6Tool(BaseTool):
+    """Fetch P6 project/activity data and ask Gemini to interpret it."""
+
+    def __init__(self) -> None:
+        self._gemini = GeminiClient()
+
+    def get_name(self) -> str:
+        return "p6_tool"
+
+    def get_description(self) -> str:
+        return "Fetches Primavera P6 EPPM REST project/activity data and analyzes it."
+
+    def get_input_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "project_code": {
+                    "type": "string",
+                    "description": "Primavera P6 project code.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Question or instruction for Gemini.",
+                },
+                "include_activities": {
+                    "type": "boolean",
+                    "description": "Whether to fetch project activity records.",
+                    "default": True,
+                },
+                "activity_limit": {
+                    "type": "integer",
+                    "description": "Maximum activity records to include in the Gemini context.",
+                    "default": 100,
+                    "minimum": 1,
+                    "maximum": 1000,
+                },
+                "include_wbs": {
+                    "type": "boolean",
+                    "description": "Whether to fetch WBS records for the project.",
+                    "default": False,
+                },
+                "include_relationships": {
+                    "type": "boolean",
+                    "description": "Whether to fetch schedule logic relationships.",
+                    "default": False,
+                },
+                "include_resource_assignments": {
+                    "type": "boolean",
+                    "description": "Whether to fetch resource assignments.",
+                    "default": False,
+                },
+                "related_record_limit": {
+                    "type": "integer",
+                    "description": "Maximum WBS/relationship/resource assignment records to include.",
+                    "default": 100,
+                    "minimum": 1,
+                    "maximum": 1000,
+                },
+                "use_mock": {
+                    "type": "boolean",
+                    "description": "Force mock data instead of calling P6 REST.",
+                    "default": False,
+                },
+            },
+            "required": ["project_code", "query"],
+            "additionalProperties": False,
+        }
+
+    async def execute(self, params: dict[str, Any]) -> str:
+        project_code = str(params["project_code"])
+        query = str(params["query"])
+        include_activities = bool(params.get("include_activities", True))
+        activity_limit = int(params.get("activity_limit", 100))
+        include_wbs = bool(params.get("include_wbs", False))
+        include_relationships = bool(params.get("include_relationships", False))
+        include_resource_assignments = bool(params.get("include_resource_assignments", False))
+        related_record_limit = int(params.get("related_record_limit", 100))
+        use_mock = bool(params.get("use_mock", False))
+
+        settings = self._load_settings()
+        if use_mock or not self._is_real_p6_configured(settings):
+            raw_data = self._build_mock_data(project_code, reason="P6_BASE_URL is not configured.")
+            return await self._gemini.process_data(json.dumps(raw_data, indent=2), query)
+
+        try:
+            p6_data = await asyncio.to_thread(
+                self._fetch_p6_data,
+                settings,
+                project_code,
+                include_activities,
+                activity_limit,
+                include_wbs,
+                include_relationships,
+                include_resource_assignments,
+                related_record_limit,
+            )
+        except requests.HTTPError as exc:
+            response_text = exc.response.text[:1000] if exc.response is not None else ""
+            return (
+                "P6 REST request failed. Check P6_BASE_URL, endpoint paths, "
+                f"authentication, and project code. Details: {exc}. "
+                f"Response body: {response_text}"
+            )
+        except requests.RequestException as exc:
+            return (
+                "Could not connect to P6 EPPM REST. Check network access, SSL, "
+                f"and P6 connection settings. Details: {exc}"
+            )
+        except Exception as exc:
+            return f"P6 tool failed before Gemini analysis: {exc}"
+
+        return await self._gemini.process_data(json.dumps(p6_data, indent=2), query)
+
+    def _fetch_p6_data(
+        self,
+        settings: P6ConnectionSettings,
+        project_code: str,
+        include_activities: bool,
+        activity_limit: int,
+        include_wbs: bool,
+        include_relationships: bool,
+        include_resource_assignments: bool,
+        related_record_limit: int,
+    ) -> dict[str, Any]:
+        session = requests.Session()
+        session.verify = settings.verify_ssl
+        self._configure_auth(session, settings)
+
+        project_response = self._fetch_endpoint(
+            session,
+            settings,
+            settings.project_endpoint,
+            project_code,
+            settings.project_filter_template,
+            settings.project_fields,
+        )
+
+        result: dict[str, Any] = {
+            "source": "Primavera P6 EPPM REST",
+            "swagger_verified": "https://primavera.iges.in:18206/p6ws/restapi/openapi.json",
+            "project_code": project_code,
+            "project_endpoint": settings.project_endpoint,
+            "project": project_response,
+        }
+
+        if include_activities:
+            activity_response = self._fetch_endpoint(
+                session,
+                settings,
+                settings.activity_endpoint,
+                project_code,
+                settings.activity_filter_template,
+                settings.activity_fields,
+            )
+            result["activity_endpoint"] = settings.activity_endpoint
+            result["activities"] = self._limit_records(activity_response, activity_limit)
+            result["activity_limit"] = activity_limit
+
+        if include_wbs:
+            wbs_response = self._fetch_endpoint(
+                session,
+                settings,
+                settings.wbs_endpoint,
+                project_code,
+                settings.wbs_filter_template,
+                settings.wbs_fields,
+            )
+            result["wbs_endpoint"] = settings.wbs_endpoint
+            result["wbs"] = self._limit_records(wbs_response, related_record_limit)
+
+        if include_relationships:
+            relationship_response = self._fetch_endpoint(
+                session,
+                settings,
+                settings.relationship_endpoint,
+                project_code,
+                settings.relationship_filter_template,
+                settings.relationship_fields,
+            )
+            result["relationship_endpoint"] = settings.relationship_endpoint
+            result["relationships"] = self._limit_records(
+                relationship_response,
+                related_record_limit,
+            )
+
+        if include_resource_assignments:
+            assignment_response = self._fetch_endpoint(
+                session,
+                settings,
+                settings.resource_assignment_endpoint,
+                project_code,
+                settings.resource_assignment_filter_template,
+                settings.resource_assignment_fields,
+            )
+            result["resource_assignment_endpoint"] = settings.resource_assignment_endpoint
+            result["resource_assignments"] = self._limit_records(
+                assignment_response,
+                related_record_limit,
+            )
+
+        return result
+
+    def _fetch_endpoint(
+        self,
+        session: requests.Session,
+        settings: P6ConnectionSettings,
+        endpoint: str,
+        project_code: str,
+        filter_template: str | None,
+        fields: str | None,
+    ) -> Any:
+        return self._get_json(
+            session,
+            self._build_url(settings.base_url or "", endpoint),
+            self._build_query_params(
+                project_code,
+                settings.filter_param,
+                filter_template,
+                settings.fields_param,
+                fields,
+            ),
+            settings.timeout_seconds,
+        )
+
+    def _get_json(
+        self,
+        session: requests.Session,
+        url: str,
+        params: dict[str, str],
+        timeout_seconds: float,
+    ) -> Any:
+        response = session.get(url, params=params, timeout=timeout_seconds)
+        response.raise_for_status()
+        if not response.text.strip():
+            return {}
+
+        content_type = response.headers.get("content-type", "")
+        if "json" in content_type.lower():
+            return response.json()
+
+        try:
+            return response.json()
+        except ValueError:
+            return {"raw_response": response.text}
+
+    def _configure_auth(
+        self,
+        session: requests.Session,
+        settings: P6ConnectionSettings,
+    ) -> None:
+        if settings.auth_mode == "basic":
+            if not settings.username or not settings.password:
+                raise ValueError("P6_AUTH_MODE=basic requires P6_USERNAME and P6_PASSWORD.")
+            session.auth = HTTPBasicAuth(settings.username, settings.password)
+            return
+
+        if settings.auth_mode == "bearer":
+            if not settings.token:
+                raise ValueError("P6_AUTH_MODE=bearer requires P6_ACCESS_TOKEN or P6_TOKEN.")
+            session.headers.update({"Authorization": f"Bearer {settings.token}"})
+            return
+
+        if settings.auth_mode == "auth_token":
+            if not settings.token:
+                raise ValueError(
+                    "P6_AUTH_MODE=auth_token requires P6_AUTH_TOKEN, P6_ACCESS_TOKEN, or P6_TOKEN."
+                )
+            session.headers.update({settings.token_header: settings.token})
+            return
+
+        if settings.auth_mode != "none":
+            raise ValueError("P6_AUTH_MODE must be one of: basic, bearer, auth_token, none.")
+
+    def _build_query_params(
+        self,
+        project_code: str,
+        filter_param: str,
+        filter_template: str | None,
+        fields_param: str,
+        fields: str | None,
+    ) -> dict[str, str]:
+        params: dict[str, str] = {}
+        if filter_template:
+            params[filter_param] = filter_template.format(project_code=project_code)
+
+        if fields:
+            params[fields_param] = fields
+
+        return params
+
+    def _load_settings(self) -> P6ConnectionSettings:
+        return P6ConnectionSettings(
+            base_url=os.getenv("P6_BASE_URL"),
+            auth_mode=os.getenv("P6_AUTH_MODE", "basic").strip().lower(),
+            username=os.getenv("P6_USERNAME"),
+            password=os.getenv("P6_PASSWORD"),
+            token=(
+                os.getenv("P6_AUTH_TOKEN")
+                or os.getenv("P6_ACCESS_TOKEN")
+                or os.getenv("P6_TOKEN")
+            ),
+            token_header=os.getenv("P6_TOKEN_HEADER", "AuthToken"),
+            project_endpoint=os.getenv("P6_PROJECT_ENDPOINT", "project"),
+            activity_endpoint=os.getenv("P6_ACTIVITY_ENDPOINT", "activity"),
+            wbs_endpoint=os.getenv("P6_WBS_ENDPOINT", "wbs"),
+            relationship_endpoint=os.getenv("P6_RELATIONSHIP_ENDPOINT", "relationship"),
+            resource_assignment_endpoint=os.getenv(
+                "P6_RESOURCE_ASSIGNMENT_ENDPOINT",
+                "resourceAssignment",
+            ),
+            filter_param=os.getenv("P6_FILTER_PARAM", "Filter"),
+            project_filter_template=os.getenv("P6_PROJECT_FILTER_TEMPLATE", "Id:eq:{project_code}"),
+            activity_filter_template=os.getenv(
+                "P6_ACTIVITY_FILTER_TEMPLATE",
+                "ProjectId:eq:{project_code}",
+            ),
+            wbs_filter_template=os.getenv("P6_WBS_FILTER_TEMPLATE", "ProjectId:eq:{project_code}"),
+            relationship_filter_template=os.getenv(
+                "P6_RELATIONSHIP_FILTER_TEMPLATE",
+                "PredecessorProjectId:eq:{project_code}:or:SuccessorProjectId:eq:{project_code}",
+            ),
+            resource_assignment_filter_template=os.getenv(
+                "P6_RESOURCE_ASSIGNMENT_FILTER_TEMPLATE",
+                "ProjectId:eq:{project_code}",
+            ),
+            fields_param=os.getenv("P6_FIELDS_PARAM", "Fields"),
+            project_fields=os.getenv(
+                "P6_PROJECT_FIELDS",
+                "ObjectId,Id,Name,Status,StartDate,FinishDate,PlannedStartDate,"
+                "ScheduledFinishDate,DataDate,SummaryTotalFloat,"
+                "SummarySchedulePercentComplete",
+            ),
+            activity_fields=os.getenv(
+                "P6_ACTIVITY_FIELDS",
+                "ObjectId,Id,Name,ProjectId,ProjectObjectId,WBSObjectId,Status,"
+                "StatusCode,StartDate,FinishDate,PlannedStartDate,"
+                "PlannedFinishDate,RemainingDuration,DurationPercentComplete,"
+                "PercentComplete,TotalFloat,FreeFloat,IsCritical",
+            ),
+            wbs_fields=os.getenv(
+                "P6_WBS_FIELDS",
+                "ObjectId,Name,ProjectId,ProjectObjectId,ParentObjectId,Status,"
+                "StartDate,FinishDate,SummaryTotalFloat,"
+                "SummarySchedulePercentComplete",
+            ),
+            relationship_fields=os.getenv(
+                "P6_RELATIONSHIP_FIELDS",
+                "ObjectId,PredecessorActivityId,PredecessorActivityName,"
+                "PredecessorProjectId,SuccessorActivityId,SuccessorActivityName,"
+                "SuccessorProjectId,Type,Lag",
+            ),
+            resource_assignment_fields=os.getenv(
+                "P6_RESOURCE_ASSIGNMENT_FIELDS",
+                "ObjectId,ActivityId,ActivityName,ProjectId,ResourceId,"
+                "ResourceName,RoleId,RoleName,StartDate,FinishDate,"
+                "RemainingDuration,PercentComplete,StatusCode",
+            ),
+            timeout_seconds=float(os.getenv("P6_TIMEOUT_SECONDS", "30")),
+            verify_ssl=os.getenv("P6_VERIFY_SSL", "true").strip().lower()
+            not in {"0", "false", "no"},
+        )
+
+    def _build_url(self, base_url: str, endpoint: str) -> str:
+        return urljoin(f"{base_url.rstrip('/')}/", endpoint.lstrip("/"))
+
+    def _is_real_p6_configured(self, settings: P6ConnectionSettings) -> bool:
+        return bool(
+            settings.base_url
+            and not settings.base_url.startswith("https://your-p6-host")
+        )
+
+    def _limit_records(self, payload: Any, limit: int) -> Any:
+        bounded_limit = max(1, min(limit, 1000))
+        if isinstance(payload, list):
+            return payload[:bounded_limit]
+
+        if isinstance(payload, dict):
+            for key in ("items", "data", "activities", "results"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    cloned = dict(payload)
+                    cloned[key] = value[:bounded_limit]
+                    cloned["returned_count"] = len(cloned[key])
+                    return cloned
+
+        return payload
+
+    def _build_mock_data(self, project_code: str, reason: str) -> dict[str, Any]:
+        return {
+            "source": "Primavera P6 EPPM",
+            "mode": "mock",
+            "reason": reason,
+            "project_code": project_code,
+            "project_name": "Airport Enabling Works",
+            "data_date": "2026-06-01",
+            "activities": [
+                {
+                    "activity_id": "A1000",
+                    "name": "Mobilize site team",
+                    "status": "complete",
+                    "percent_complete": 100,
+                    "total_float_days": 0,
+                },
+                {
+                    "activity_id": "A2210",
+                    "name": "Install temporary utilities",
+                    "status": "in_progress",
+                    "percent_complete": 62,
+                    "total_float_days": -4,
+                },
+                {
+                    "activity_id": "A3350",
+                    "name": "Complete foundation pour",
+                    "status": "not_started",
+                    "percent_complete": 0,
+                    "total_float_days": 8,
+                },
+            ],
+            "metrics": {"critical_activities": 12, "late_activities": 7},
+        }
