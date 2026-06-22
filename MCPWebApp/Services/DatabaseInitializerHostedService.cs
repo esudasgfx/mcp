@@ -1,5 +1,7 @@
 using MCPWebApp.Data;
+using MCPWebApp.Models;
 using Microsoft.EntityFrameworkCore;
+using System.Text.Json;
 
 namespace MCPWebApp.Services;
 
@@ -32,6 +34,7 @@ public sealed class DatabaseInitializerHostedService : IHostedService
         var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var configStore = scope.ServiceProvider.GetRequiredService<IConfigStoreService>();
         var ragMemory = scope.ServiceProvider.GetRequiredService<IRagMemoryService>();
+        var ragIndexingQueue = scope.ServiceProvider.GetRequiredService<IBackgroundRagIndexingQueue>();
 
         // For this starter app we create the schema if it does not exist, then
         // seed defaults into ConfigSettings. Enterprise deployments can replace
@@ -43,14 +46,31 @@ public sealed class DatabaseInitializerHostedService : IHostedService
         var settings = await configStore.GetSettingsAsync(cancellationToken);
         foreach (var setting in settings)
         {
-            await ragMemory.IndexConfigSettingAsync(setting, cancellationToken);
+            await ragIndexingQueue.QueueAsync(
+                new MemoryIndexJob
+                {
+                    SourceType = "config_setting",
+                    SourceId = setting.Id,
+                    Content = BuildConfigMemoryContent(setting),
+                    MetadataJson = JsonSerializer.Serialize(setting)
+                },
+                cancellationToken);
         }
 
-        _logger.LogInformation("Database schema checked, default config settings seeded, and semantic memory initialized.");
+        _logger.LogInformation("Database schema checked, default config settings seeded, and semantic memory indexing queued.");
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
     {
         return Task.CompletedTask;
+    }
+
+    private static string BuildConfigMemoryContent(ConfigSettingDto setting)
+    {
+        return string.Join(
+            Environment.NewLine,
+            $"Configuration setting: {setting.Category}:{setting.Key}",
+            $"Effective value/reference: {setting.EffectiveValue}",
+            $"Description: {setting.Description}");
     }
 }

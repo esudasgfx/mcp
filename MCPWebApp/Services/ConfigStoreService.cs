@@ -143,6 +143,10 @@ public sealed class ConfigStoreService : IConfigStoreService
         yield return Build("RAG", "TopK", _configuration["RAG:TopK"] ?? "5", "Number of semantic memories retrieved per user query.");
         yield return Build("RAG", "MinSimilarity", _configuration["RAG:MinSimilarity"] ?? "0.72", "Minimum cosine similarity required for retrieved memories.");
         yield return Build("RAG", "MaxContextChars", _configuration["RAG:MaxContextChars"] ?? "6000", "Maximum retrieved memory characters injected into the active query.");
+        yield return Build("RAG", "SearchTimeoutMs", _configuration["RAG:SearchTimeoutMs"] ?? "1500", "Maximum time spent retrieving semantic memory before continuing without RAG context.");
+        yield return Build("RAG", "EmbeddingCacheMinutes", _configuration["RAG:EmbeddingCacheMinutes"] ?? "30", "How long repeated embedding results are cached in memory.");
+        yield return Build("RAG", "EmbeddingFailureCooldownSeconds", _configuration["RAG:EmbeddingFailureCooldownSeconds"] ?? "60", "Cooldown after an embedding API failure before retrying embeddings.");
+        yield return Build("RAG", "IndexQueueCapacity", _configuration["RAG:IndexQueueCapacity"] ?? "1000", "Maximum queued background semantic indexing jobs.");
         yield return Build("P6", "BaseUrl", _configuration["P6:BaseUrl"] ?? "https://your-p6-host/p6ws/restapi", "Primavera P6 EPPM REST base URL.");
         yield return Build("P6", "Username", "P6_USERNAME", "Environment variable containing the P6 username.", isSecret: true, secretReference: "P6_USERNAME");
         yield return Build("P6", "Password", "P6_PASSWORD", "Environment variable containing the P6 password.", isSecret: true, secretReference: "P6_PASSWORD");

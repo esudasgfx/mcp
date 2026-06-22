@@ -11,11 +11,14 @@ builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));
 builder.Services.AddHttpClient();
 builder.Services.AddHttpClient<IEmbeddingService, GeminiEmbeddingService>();
+builder.Services.AddMemoryCache();
 builder.Services.AddControllers();
 builder.Services.AddRazorPages();
 builder.Services.AddScoped<IConfigStoreService, ConfigStoreService>();
 builder.Services.AddScoped<IChatHistoryService, ChatHistoryService>();
 builder.Services.AddScoped<IRagMemoryService, RagMemoryService>();
+builder.Services.AddSingleton<IBackgroundRagIndexingQueue, BackgroundRagIndexingQueue>();
+builder.Services.AddHostedService<BackgroundRagIndexingService>();
 builder.Services.AddHostedService<DatabaseInitializerHostedService>();
 
 builder.Services.AddSingleton<MCPClientService>();

@@ -15,6 +15,7 @@ public sealed class ChatController : ControllerBase
     private readonly IMCPClientService _mcpClientService;
     private readonly IChatHistoryService _chatHistoryService;
     private readonly IRagMemoryService _ragMemoryService;
+    private readonly IBackgroundRagIndexingQueue _ragIndexingQueue;
     private readonly RagOptions _ragOptions;
     private readonly ILogger<ChatController> _logger;
 
@@ -22,12 +23,14 @@ public sealed class ChatController : ControllerBase
         IMCPClientService mcpClientService,
         IChatHistoryService chatHistoryService,
         IRagMemoryService ragMemoryService,
+        IBackgroundRagIndexingQueue ragIndexingQueue,
         IOptions<RagOptions> ragOptions,
         ILogger<ChatController> logger)
     {
         _mcpClientService = mcpClientService;
         _chatHistoryService = chatHistoryService;
         _ragMemoryService = ragMemoryService;
+        _ragIndexingQueue = ragIndexingQueue;
         _ragOptions = ragOptions.Value;
         _logger = logger;
     }
@@ -76,9 +79,7 @@ public sealed class ChatController : ControllerBase
             ? "{}"
             : request.Parameters.GetRawText();
         var userQuery = ExtractQuery(request.Parameters) ?? parametersJson;
-        var retrievedMemories = await _ragMemoryService.SearchAsync(
-            userQuery,
-            cancellationToken: cancellationToken);
+        var retrievedMemories = await TryRetrieveMemoriesAsync(userQuery, cancellationToken);
         var augmentedArguments = AugmentParametersWithMemory(
             request.Parameters,
             userQuery,
@@ -93,13 +94,12 @@ public sealed class ChatController : ControllerBase
             parametersJson: parametersJson,
             eventType: "tool_call_request",
             cancellationToken: cancellationToken);
-        await _ragMemoryService.UpsertMemoryAsync(
-            "chat_message",
+        await QueueMemoryIndexAsync(
             userMessage.Id,
+            session.Id,
+            request.ToolName,
             BuildMemoryContent(userMessage.Role, userMessage.ToolName, userMessage.MessageText, userMessage.ParametersJson),
-            chatSessionId: session.Id,
-            toolName: request.ToolName,
-            cancellationToken: cancellationToken);
+            cancellationToken);
 
         try
         {
@@ -152,17 +152,16 @@ public sealed class ChatController : ControllerBase
                 success: true,
                 durationMs: stopwatch.ElapsedMilliseconds,
                 cancellationToken: cancellationToken);
-            await _ragMemoryService.UpsertMemoryAsync(
-                "chat_message",
+            await QueueMemoryIndexAsync(
                 assistantMessage.Id,
+                session.Id,
+                request.ToolName,
                 BuildMemoryContent(
                     assistantMessage.Role,
                     assistantMessage.ToolName,
                     assistantMessage.ResponseText,
                     assistantMessage.ParametersJson),
-                chatSessionId: session.Id,
-                toolName: request.ToolName,
-                cancellationToken: cancellationToken);
+                cancellationToken);
 
             return Ok(new ChatResponse
             {
@@ -259,6 +258,57 @@ public sealed class ChatController : ControllerBase
     {
         var session = await _chatHistoryService.GetSessionAsync(sessionId, cancellationToken);
         return session is null ? NotFound() : Ok(session);
+    }
+
+    private async Task<List<MemorySearchResultDto>> TryRetrieveMemoriesAsync(
+        string userQuery,
+        CancellationToken cancellationToken)
+    {
+        if (!_ragOptions.Enabled || _ragOptions.SearchTimeoutMs <= 0)
+        {
+            return [];
+        }
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromMilliseconds(_ragOptions.SearchTimeoutMs));
+
+        try
+        {
+            return await _ragMemoryService.SearchAsync(
+                userQuery,
+                cancellationToken: timeout.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogDebug(
+                "RAG memory retrieval exceeded {SearchTimeoutMs} ms and was skipped.",
+                _ragOptions.SearchTimeoutMs);
+            return [];
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "RAG memory retrieval failed and was skipped.");
+            return [];
+        }
+    }
+
+    private ValueTask QueueMemoryIndexAsync(
+        Guid messageId,
+        Guid sessionId,
+        string? toolName,
+        string content,
+        CancellationToken cancellationToken)
+    {
+        return _ragIndexingQueue.QueueAsync(
+            new MemoryIndexJob
+            {
+                SourceType = "chat_message",
+                SourceId = messageId,
+                ChatSessionId = sessionId,
+                ToolName = toolName,
+                Content = content
+            },
+            cancellationToken);
     }
 
     private static string ExtractToolContent(string responseJson, out string? error)

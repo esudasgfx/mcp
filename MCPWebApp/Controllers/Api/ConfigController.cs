@@ -12,20 +12,20 @@ public sealed class ConfigController : ControllerBase
     private readonly IConfigStoreService _configStoreService;
     private readonly IChatHistoryService _chatHistoryService;
     private readonly IMCPClientService _mcpClientService;
-    private readonly IRagMemoryService _ragMemoryService;
+    private readonly IBackgroundRagIndexingQueue _ragIndexingQueue;
     private readonly ILogger<ConfigController> _logger;
 
     public ConfigController(
         IConfigStoreService configStoreService,
         IChatHistoryService chatHistoryService,
         IMCPClientService mcpClientService,
-        IRagMemoryService ragMemoryService,
+        IBackgroundRagIndexingQueue ragIndexingQueue,
         ILogger<ConfigController> logger)
     {
         _configStoreService = configStoreService;
         _chatHistoryService = chatHistoryService;
         _mcpClientService = mcpClientService;
-        _ragMemoryService = ragMemoryService;
+        _ragIndexingQueue = ragIndexingQueue;
         _logger = logger;
     }
 
@@ -62,14 +62,25 @@ public sealed class ConfigController : ControllerBase
                 eventType: "config_change",
                 success: true,
                 cancellationToken: cancellationToken);
-            await _ragMemoryService.IndexConfigSettingAsync(updated, cancellationToken);
-            await _ragMemoryService.UpsertMemoryAsync(
-                "chat_message",
-                configMessage.Id,
-                $"Configuration change: {request.Reason}\n{updated.Category}:{updated.Key} -> {updated.EffectiveValue}",
-                chatSessionId: session.Id,
-                metadataJson: JsonSerializer.Serialize(request),
-                cancellationToken: cancellationToken);
+            await _ragIndexingQueue.QueueAsync(
+                new MemoryIndexJob
+                {
+                    SourceType = "config_setting",
+                    SourceId = updated.Id,
+                    Content = BuildConfigMemoryContent(updated),
+                    MetadataJson = JsonSerializer.Serialize(updated)
+                },
+                cancellationToken);
+            await _ragIndexingQueue.QueueAsync(
+                new MemoryIndexJob
+                {
+                    SourceType = "chat_message",
+                    SourceId = configMessage.Id,
+                    ChatSessionId = session.Id,
+                    Content = $"Configuration change: {request.Reason}\n{updated.Category}:{updated.Key} -> {updated.EffectiveValue}",
+                    MetadataJson = JsonSerializer.Serialize(request)
+                },
+                cancellationToken);
 
             // Settings such as Gemini model, tool endpoints, and Python process
             // options are read by the Python MCP process on startup. Restarting
@@ -90,5 +101,14 @@ public sealed class ConfigController : ControllerBase
                 details = ex.Message
             });
         }
+    }
+
+    private static string BuildConfigMemoryContent(ConfigSettingDto setting)
+    {
+        return string.Join(
+            Environment.NewLine,
+            $"Configuration setting: {setting.Category}:{setting.Key}",
+            $"Effective value/reference: {setting.EffectiveValue}",
+            $"Description: {setting.Description}");
     }
 }
